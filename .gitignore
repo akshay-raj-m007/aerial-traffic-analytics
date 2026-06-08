@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+ 
+# Model weights — too large for Git; place manually or use Git LFS
+assets/models/*.pt
+assets/models/*.onnx
+ 
+# Videos — never commit raw footage
+assets/sample_video/*.mp4
+assets/sample_video/*.avi
+assets/sample_video/*.mov
+ 
+# Outputs — generated at runtime
+outputs/
+ 
+# IDE
+.vscode/
+.idea/
+*.DS_Store

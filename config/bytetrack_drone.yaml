@@ -1,0 +1,24 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ByteTrack configuration tuned for aerial drone traffic footage.
+# Reference: https://docs.ultralytics.com/reference/trackers/byte_tracker/
+# ─────────────────────────────────────────────────────────────────────────────
+ 
+tracker_type: bytetrack
+ 
+# ── Detection thresholds ──────────────────────────────────────────────────────
+track_high_thresh: 0.35    # min confidence to start / maintain a track
+track_low_thresh:  0.10    # min confidence for the low-score association pass
+new_track_thresh:  0.40    # min confidence to create a brand-new track ID
+ 
+# ── Track lifecycle ───────────────────────────────────────────────────────────
+track_buffer:  40          # frames a track survives without a detection
+                           # (~1.3 s at 30 fps) — increase for slow-moving vehicles
+match_thresh:  0.85        # IoU threshold for high-score matching step
+                           # lower = stricter spatial match required
+ 
+# ── Frame rate ────────────────────────────────────────────────────────────────
+# Used internally for Kalman filter motion model.
+# Set to your actual drone video FPS.
+frame_rate:    30
+
+fuse_score: True
