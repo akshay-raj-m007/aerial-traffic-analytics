@@ -1,23 +1,25 @@
 """
 core/tracker.py
 Maintains per-vehicle trajectory state across frames.
-Now stores GPS trail (lat, lon) in addition to pixel and world trails.
+
+pixel_trail is an unbounded list (full history) — every position since
+first detection is kept so persistent trails render after vehicle is gone,
+matching the Colab script's defaultdict(list) pattern.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 import math
-import numpy as np
 
 
 @dataclass
 class TrackState:
     track_id:    int
     class_name:  str
-    pixel_trail: list[tuple[int, int]]          = field(default_factory=list)
-    world_trail: list[tuple[float, float]]      = field(default_factory=list)
-    gps_trail:   list[tuple[float, float]]      = field(default_factory=list)  # (lat, lon)
-    frame_trail: list[int]                      = field(default_factory=list)  # frame idx per point
+    pixel_trail: list[tuple[int, int]]      = field(default_factory=list)
+    world_trail: list[tuple[float, float]]  = field(default_factory=list)
+    gps_trail:   list[tuple[float, float]]  = field(default_factory=list)
+    frame_trail: list[int]                  = field(default_factory=list)
     first_frame: int   = 0
     last_frame:  int   = 0
     _fps:        float = 30.0
@@ -71,6 +73,10 @@ class TrajectoryTracker:
         self._tracks: dict[int, TrackState] = {}
 
     def update(self, detections, frame_idx: int) -> None:
+        """
+        Call BEFORE annotate_frame so the current frame's position is already
+        in the trail when trails are drawn (matches Colab Step 1 → Step 2 order).
+        """
         for det in detections:
             if det.track_id is None:
                 continue
@@ -88,15 +94,18 @@ class TrajectoryTracker:
             if det.wx is not None and det.wy is not None:
                 track.world_trail.append((det.wx, det.wy))
 
-            # Store GPS if available on detection
             if hasattr(det, "lat") and det.lat is not None and det.lon is not None:
                 track.gps_trail.append((det.lat, det.lon))
 
     def get_pixel_trails(self) -> dict[int, list[tuple[int, int]]]:
+        """Full unbounded pixel trail history for every track ever seen."""
         return {tid: t.pixel_trail for tid, t in self._tracks.items()}
 
+    def get_track_classes(self) -> dict[int, str]:
+        """Returns {track_id: class_name} for every known track."""
+        return {tid: t.class_name for tid, t in self._tracks.items()}
+
     def get_live_speeds(self) -> dict[int, Optional[float]]:
-        """Returns {track_id: speed_kmph} for every active track."""
         return {tid: t.live_speed_kmph for tid, t in self._tracks.items()}
 
     def summary(self) -> list[dict]:
@@ -108,7 +117,6 @@ class TrajectoryTracker:
             w_dist = t.world_distance
             w_vel  = (w_dist / duration_sec) if (w_dist and duration_sec > 0) else None
 
-            # Start/end GPS
             start_gps = t.gps_trail[0]  if t.gps_trail else None
             end_gps   = t.gps_trail[-1] if t.gps_trail else None
 
@@ -128,12 +136,10 @@ class TrajectoryTracker:
                 "start_cy": t.pixel_trail[0][1]  if t.pixel_trail else None,
                 "end_cx":   t.pixel_trail[-1][0] if t.pixel_trail else None,
                 "end_cy":   t.pixel_trail[-1][1] if t.pixel_trail else None,
-                # GPS start/end
                 "start_lat": round(start_gps[0], 8) if start_gps else None,
                 "start_lon": round(start_gps[1], 8) if start_gps else None,
                 "end_lat":   round(end_gps[0], 8)   if end_gps   else None,
                 "end_lon":   round(end_gps[1], 8)   if end_gps   else None,
-                # Full trails
                 "pixel_trail": t.pixel_trail,
                 "world_trail": t.world_trail if t.world_trail else None,
                 "gps_trail":   t.gps_trail   if t.gps_trail   else None,
@@ -141,17 +147,12 @@ class TrajectoryTracker:
         return rows
 
     def gps_trail_rows(self) -> list[dict]:
-        """
-        Flat list — one row per detection point per track with GPS coords.
-        Used to build the gps_trails.csv export.
-        """
         rows = []
         for tid, t in self._tracks.items():
-            # Use GPS trail if available; fall back to None rows so frame_trail stays aligned
             for i, (px, py) in enumerate(t.pixel_trail):
                 frame = t.frame_trail[i] if i < len(t.frame_trail) else None
-                wx = t.world_trail[i][0] if i < len(t.world_trail) else None
-                wy = t.world_trail[i][1] if i < len(t.world_trail) else None
+                wx  = t.world_trail[i][0] if i < len(t.world_trail) else None
+                wy  = t.world_trail[i][1] if i < len(t.world_trail) else None
                 lat = round(t.gps_trail[i][0], 8) if i < len(t.gps_trail) else None
                 lon = round(t.gps_trail[i][1], 8) if i < len(t.gps_trail) else None
                 rows.append({

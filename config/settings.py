@@ -26,6 +26,12 @@ OUTPUT_DIR     = Path(os.getenv("OUTPUT_DIR",     str(ROOT / "outputs")))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE", "0.15"))
 IOU_THRESHOLD        = float(os.getenv("IOU",        "0.45"))
 IMG_SIZE             = int(os.getenv("IMG_SIZE",     "1280"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trajectory rendering/export thresholds
+# ─────────────────────────────────────────────────────────────────────────────
+
+MIN_TRAIL_POINTS = int(os.getenv("MIN_TRAIL_POINTS", "2"))
  
 # ─────────────────────────────────────────────────────────────────────────────
 # Class mapping  (raw model class_id → merged label)
