@@ -26,6 +26,7 @@ OUTPUT_DIR     = Path(os.getenv("OUTPUT_DIR",     str(ROOT / "outputs")))
 CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE", "0.15"))
 IOU_THRESHOLD        = float(os.getenv("IOU",        "0.45"))
 IMG_SIZE             = int(os.getenv("IMG_SIZE",     "1280"))
+PEDESTRIAN_MIN_Y     = int(os.getenv("PEDESTRIAN_MIN_Y", "900"))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trajectory rendering/export thresholds

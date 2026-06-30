@@ -1,6 +1,6 @@
 {
   "camera_id": "cam1",
-  "video": "assets/sample_video/drone_3_sec30.mp4",
+  "video": "assets/sample_video/drone_3.mp4",
   "origin_gps": [80.5058750, 16.3683500],
   "calibration_points": [
     {

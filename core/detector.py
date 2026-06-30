@@ -18,7 +18,7 @@ from config.settings import (
     BYTETRACK_YAML, CLASS_MAP, COLOR_MAP,
     CONFIDENCE_THRESHOLD, DEFAULT_COLOR,
     IMG_SIZE, IOU_THRESHOLD, MODEL_PATH,
-    MIN_TRAIL_POINTS,
+    MIN_TRAIL_POINTS, PEDESTRIAN_MIN_Y,
 )
 
 
@@ -70,12 +70,19 @@ class Detector:
 
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
-        print(f"[Detector] Loading model: {self.model_path}")
+        print(f"[Detector] Loading track model: {self.model_path}")
         self.model = YOLO(str(self.model_path))
+        print(f"[Detector] Loading predict model: {self.model_path}")
+        self.model_pred = YOLO(str(self.model_path))
         print(f"[Detector] Model classes: {self.model.names}")
 
+        # Custom tracker state for low-confidence pedestrians (drivers)
+        self.next_ped_id = 10000
+        self.active_peds = {}  # track_id -> {"cx": cx, "cy": cy, "last_seen": frame_idx}
+
     def detect(self, frame: np.ndarray, frame_idx: int = 0) -> list[Detection]:
-        results = self.model.track(
+        # 1. Run standard tracking for high-confidence vehicles
+        results_track = self.model.track(
             frame,
             imgsz=self.imgsz,
             conf=self.conf,
@@ -86,29 +93,125 @@ class Detector:
             persist=True,
             verbose=False,
         )
-        boxes = results[0].boxes
-        if boxes is None or len(boxes) == 0:
-            return []
-
-        track_ids = (
-            boxes.id.int().cpu().tolist()
-            if boxes.id is not None
-            else [None] * len(boxes)
-        )
-
+        
         detections = []
-        for i in range(len(boxes)):
-            x1, y1, x2, y2 = map(int, boxes.xyxy[i].cpu().numpy())
-            conf       = round(float(boxes.conf[i]), 4)
-            cls        = int(boxes.cls[i])
-            track_id   = track_ids[i]
-            class_name = CLASS_MAP.get(cls, "unknown")
-            cx, cy     = (x1 + x2) // 2, (y1 + y2) // 2
+        boxes_track = results_track[0].boxes
+        if boxes_track is not None and len(boxes_track) > 0:
+            track_ids = (
+                boxes_track.id.int().cpu().tolist()
+                if boxes_track.id is not None
+                else [None] * len(boxes_track)
+            )
+            for i in range(len(boxes_track)):
+                x1, y1, x2, y2 = map(int, boxes_track.xyxy[i].cpu().numpy())
+                conf       = round(float(boxes_track.conf[i]), 4)
+                cls        = int(boxes_track.cls[i])
+                track_id   = track_ids[i]
+                class_name = CLASS_MAP.get(cls, "unknown")
+                cx, cy     = (x1 + x2) // 2, (y1 + y2) // 2
+                
+                # Skip pedestrians from the standard high-confidence tracker to avoid duplicate/conflicting IDs
+                if class_name == "pedestrian":
+                    continue
+                    
+                detections.append(Detection(
+                    frame=frame_idx, track_id=track_id,
+                    class_id=cls, class_name=class_name, confidence=conf,
+                    x1=x1, y1=y1, x2=x2, y2=y2, cx=cx, cy=cy,
+                ))
+
+        # 2. Run low-confidence prediction to find pedestrians (drivers)
+        results_pred = self.model_pred(
+            frame,
+            imgsz=self.imgsz,
+            conf=0.01,
+            iou=self.iou,  
+            agnostic_nms=self.agnostic_nms,
+            augment=self.augment,
+            verbose=False,
+        )
+        
+        boxes_pred = results_pred[0].boxes
+        ped_detections = []
+        if boxes_pred is not None and len(boxes_pred) > 0:
+            for box in boxes_pred:
+                cls = int(box.cls[0].item())
+                class_name = CLASS_MAP.get(cls, "unknown")
+                if class_name == "pedestrian":
+                    conf = round(float(box.conf[0].item()), 4)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    if cy < PEDESTRIAN_MIN_Y:
+                        continue
+                    ped_detections.append({
+                        "cls": cls,
+                        "class_name": class_name,
+                        "conf": conf,
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "cx": cx, "cy": cy
+                    })
+
+        # 3. Match low-confidence pedestrians using a greedy centroid distance tracker
+        import math
+        unmatched_dets = list(ped_detections)
+        max_dist = 50.0
+        
+        # Sort active peds by recency
+        sorted_active_ids = sorted(
+            self.active_peds.keys(), 
+            key=lambda k: self.active_peds[k]["last_seen"], 
+            reverse=True
+        )
+        
+        # Clean up old tracks not seen for > 40 frames
+        for tid in list(self.active_peds.keys()):
+            if frame_idx - self.active_peds[tid]["last_seen"] > 40:
+                del self.active_peds[tid]
+                
+        # Greedily associate
+        for tid in sorted_active_ids:
+            if tid not in self.active_peds:
+                continue
+            track = self.active_peds[tid]
+            best_idx = -1
+            min_d = max_dist
+            
+            for j, det in enumerate(unmatched_dets):
+                d = math.hypot(det["cx"] - track["cx"], det["cy"] - track["cy"])
+                if d < min_d:
+                    min_d = d
+                    best_idx = j
+                    
+            if best_idx != -1:
+                det = unmatched_dets.pop(best_idx)
+                self.active_peds[tid] = {
+                    "cx": det["cx"],
+                    "cy": det["cy"],
+                    "last_seen": frame_idx
+                }
+                detections.append(Detection(
+                    frame=frame_idx, track_id=tid,
+                    class_id=det["cls"], class_name=det["class_name"], confidence=det["conf"],
+                    x1=det["x1"], y1=det["y1"], x2=det["x2"], y2=det["y2"],
+                    cx=det["cx"], cy=det["cy"]
+                ))
+                
+        # Start new tracks for unmatched detections
+        for det in unmatched_dets:
+            tid = self.next_ped_id
+            self.next_ped_id += 1
+            self.active_peds[tid] = {
+                "cx": det["cx"],
+                "cy": det["cy"],
+                "last_seen": frame_idx
+            }
             detections.append(Detection(
-                frame=frame_idx, track_id=track_id,
-                class_id=cls, class_name=class_name, confidence=conf,
-                x1=x1, y1=y1, x2=x2, y2=y2, cx=cx, cy=cy,
+                frame=frame_idx, track_id=tid,
+                class_id=det["cls"], class_name=det["class_name"], confidence=det["conf"],
+                x1=det["x1"], y1=det["y1"], x2=det["x2"], y2=det["y2"],
+                cx=det["cx"], cy=det["cy"]
             ))
+
         return detections
 
     @staticmethod
@@ -138,6 +241,8 @@ class Detector:
                 continue
             # Exact Colab pattern: track_classes.get(tid, "car") — always a valid color
             label_name = tc.get(tid, "car")
+            if label_name == "pedestrian" and len(pts) < 20:
+                continue
             color      = COLOR_MAP.get(label_name, DEFAULT_COLOR)
 
             for i in range(1, len(pts)):
@@ -152,6 +257,11 @@ class Detector:
 
         # ── STEP 2: Draw boxes, labels, center dots on top ──
         for det in detections:
+            if det.class_name == "pedestrian" and det.track_id is not None:
+                pts = trajectories.get(det.track_id, [])
+                if len(pts) < 20:
+                    continue
+
             color = COLOR_MAP.get(det.class_name, DEFAULT_COLOR)
             label = f"ID:{det.track_id} {det.class_name} {det.confidence:.2f}"
 
