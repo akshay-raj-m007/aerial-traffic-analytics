@@ -381,6 +381,28 @@ class ROICanvas(QLabel):
 
 
 # ---------------------------------------------------------------------------
+# IoU Helper
+# ---------------------------------------------------------------------------
+def calculate_iou(box1: tuple[int, int, int, int], box2: tuple[int, int, int, int]) -> float:
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+   
+    xi1 = max(x1_1, x1_2)
+    yi1 = max(y1_1, y1_2)
+    xi2 = min(x2_1, x2_2)
+    yi2 = min(y2_1, y2_2)
+   
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+   
+    union_area = box1_area + box2_area - inter_area
+    if union_area == 0:
+        return 0.0
+    return inter_area / union_area
+
+
+# ---------------------------------------------------------------------------
 # Worker thread — runs the pipeline without freezing the UI
 # ---------------------------------------------------------------------------
 class PipelineWorker(QThread):
@@ -463,7 +485,7 @@ class PipelineWorker(QThread):
             all_detections = []
             frame_idx = 0
 
-            # Set up OpenCV MIL trackers for manually drawn boxes
+            # Set up hybrid trackers for manually drawn boxes
             manual_trackers = []
             for idx, box in enumerate(self.static_boxes):
                 cls_name = box.get("class_name") or "car"
@@ -480,7 +502,9 @@ class PipelineWorker(QThread):
                     "track_id": 9000 + idx,
                     "frame_idx": box.get("frame_idx", 0),
                     "active": True,
-                    "initialized": False,
+                    "initialized_mil": False,
+                    "bound_yolo_track_id": None,
+                    "lost_frames_count": 0,
                     "box": box
                 })
 
@@ -505,55 +529,59 @@ class PipelineWorker(QThread):
                     if not mt["active"]:
                         continue
 
-                    # If this tracker starts on the current frame index
-                    if not mt["initialized"] and frame_idx == mt["frame_idx"]:
-                        box = mt["box"]
-                        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-                        
-                        # bound check coords
-                        x1 = max(0, min(x1, width - 1))
-                        y1 = max(0, min(y1, height - 1))
-                        x2 = max(0, min(x2, width - 1))
-                        y2 = max(0, min(y2, height - 1))
-                        w = x2 - x1
-                        h = y2 - y1
+                    # If this tracker has not reached its start frame yet
+                    if frame_idx < mt["frame_idx"]:
+                        continue
 
-                        if w >= 5 and h >= 5:
-                            try:
-                                mt["tracker"].init(frame, (x1, y1, w, h))
-                                mt["initialized"] = True
-                                self.log.emit(f"[Manual Tracker] Initiated tracking for ID {mt['track_id']} ({mt['class_name']}) at F{frame_idx}")
-                            except Exception as e:
-                                mt["active"] = False
-                                self.log.emit(f"[Manual Tracker] Error initializing tracker ID {mt['track_id']}: {e}")
+                    # Bounding coordinates for manual box on its start frame or last known
+                    box = mt["box"]
+                    m_x1, m_y1, m_x2, m_y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+
+                    # Case 1: Bound to a YOLO track ID
+                    if mt["bound_yolo_track_id"] is not None:
+                        matching_det = None
+                        for det in detections:
+                            if det.track_id == mt["bound_yolo_track_id"]:
+                                matching_det = det
+                                break
+
+                        if matching_det is not None:
+                            # Update coordinates to match YOLO detection
+                            x1, y1, x2, y2 = matching_det.x1, matching_det.y1, matching_det.x2, matching_det.y2
+                            cx, cy = matching_det.cx, matching_det.cy
+                           
+                            # Reset lost frames counter
+                            mt["lost_frames_count"] = 0
+                           
+                            # Update tracker's internal box coordinates
+                            mt["box"]["x1"] = x1
+                            mt["box"]["y1"] = y1
+                            mt["box"]["x2"] = x2
+                            mt["box"]["y2"] = y2
+
+                            if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
+                                continue  # skip injection, but keep tracker active
+
+                            manual_det = Detection(
+                                frame=frame_idx,
+                                track_id=mt["track_id"],
+                                class_id=mt["class_id"],
+                                class_name=mt["class_name"],
+                                confidence=1.0,
+                                x1=x1, y1=y1, x2=x2, y2=y2,
+                                cx=cx, cy=cy
+                            )
+                            detections.append(manual_det)
                         else:
-                            mt["active"] = False
-                            self.log.emit(f"[Manual Tracker] Tracker ID {mt['track_id']} bounding box too small ({w}x{h})")
-
-                    # If the tracker is active and initialized, update it with the new frame
-                    elif mt["initialized"]:
-                        try:
-                            success, bbox = mt["tracker"].update(frame)
-                            if success:
-                                tx, ty, tw, th = [int(v) for v in bbox]
-                                x1 = max(0, min(tx, width - 1))
-                                y1 = max(0, min(ty, height - 1))
-                                x2 = max(0, min(tx + tw, width - 1))
-                                y2 = max(0, min(ty + th, height - 1))
+                            # YOLO lost the track in this frame (short-term occlusion fallback)
+                            mt["lost_frames_count"] += 1
+                            if mt["lost_frames_count"] <= 30:
+                                x1, y1, x2, y2 = mt["box"]["x1"], mt["box"]["y1"], mt["box"]["x2"], mt["box"]["y2"]
                                 cx = (x1 + x2) // 2
                                 cy = (y1 + y2) // 2
-
-                                # Update tracking box positions
-                                mt["box"]["x1"] = x1
-                                mt["box"]["y1"] = y1
-                                mt["box"]["x2"] = x2
-                                mt["box"]["y2"] = y2
-
-                                # Check if tracked center remains inside ROI
-                                if roi_poly is not None:
-                                    if cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
-                                        continue  # skip injection, but keep tracker active
-
+                                if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
+                                    continue
+                               
                                 manual_det = Detection(
                                     frame=frame_idx,
                                     track_id=mt["track_id"],
@@ -566,20 +594,33 @@ class PipelineWorker(QThread):
                                 detections.append(manual_det)
                             else:
                                 mt["active"] = False
-                                self.log.emit(f"[Manual Tracker] Lost target ID {mt['track_id']} at frame {frame_idx}")
-                        except Exception as e:
-                            mt["active"] = False
-                            self.log.emit(f"[Manual Tracker] Exception tracking ID {mt['track_id']} at frame {frame_idx}: {e}")
+                                self.log.emit(f"[Manual Tracker] Lost target ID {mt['track_id']} (YOLO track {mt['bound_yolo_track_id']} disappeared)")
 
-                    # Inject immediate detection on first initialization frame
-                    if mt["initialized"] and frame_idx == mt["frame_idx"]:
-                        box = mt["box"]
-                        x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
-                        cx = (x1 + x2) // 2
-                        cy = (y1 + y2) // 2
-                        if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
-                            pass
-                        else:
+                    # Case 2: Not bound to YOLO yet, try to find an overlapping YOLO track in this frame
+                    else:
+                        best_det = None
+                        best_iou = 0.0
+                        for det in detections:
+                            if det.track_id is not None:
+                                iou = calculate_iou((m_x1, m_y1, m_x2, m_y2), (det.x1, det.y1, det.x2, det.y2))
+                                if iou > best_iou:
+                                    best_iou = iou
+                                    best_det = det
+
+                        if best_iou >= 0.20:
+                            mt["bound_yolo_track_id"] = best_det.track_id
+                            self.log.emit(f"[Manual Tracker] Bound manual track {mt['track_id']} to YOLO track {best_det.track_id} (IoU={best_iou:.2f})")
+                           
+                            x1, y1, x2, y2 = best_det.x1, best_det.y1, best_det.x2, best_det.y2
+                            cx, cy = best_det.cx, best_det.cy
+                            mt["box"]["x1"] = x1
+                            mt["box"]["y1"] = y1
+                            mt["box"]["x2"] = x2
+                            mt["box"]["y2"] = y2
+
+                            if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
+                                continue
+
                             manual_det = Detection(
                                 frame=frame_idx,
                                 track_id=mt["track_id"],
@@ -590,6 +631,80 @@ class PipelineWorker(QThread):
                                 cx=cx, cy=cy
                             )
                             detections.append(manual_det)
+
+                        # Case 3: Fallback: No overlapping YOLO track. Use OpenCV MIL Tracker
+                        else:
+                            if not mt["initialized_mil"]:
+                                x1 = max(0, min(m_x1, width - 1))
+                                y1 = max(0, min(m_y1, height - 1))
+                                x2 = max(0, min(m_x2, width - 1))
+                                y2 = max(0, min(m_y2, height - 1))
+                                w = x2 - x1
+                                h = y2 - y1
+
+                                if w >= 5 and h >= 5:
+                                    try:
+                                        mt["tracker"].init(frame, (x1, y1, w, h))
+                                        mt["initialized_mil"] = True
+                                        self.log.emit(f"[Manual Tracker] No YOLO overlap. Initialized MIL fallback for ID {mt['track_id']} at F{frame_idx}")
+                                       
+                                        cx = (x1 + x2) // 2
+                                        cy = (y1 + y2) // 2
+                                        if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
+                                            pass
+                                        else:
+                                            manual_det = Detection(
+                                                frame=frame_idx,
+                                                track_id=mt["track_id"],
+                                                class_id=mt["class_id"],
+                                                class_name=mt["class_name"],
+                                                confidence=1.0,
+                                                x1=x1, y1=y1, x2=x2, y2=y2,
+                                                cx=cx, cy=cy
+                                            )
+                                            detections.append(manual_det)
+                                    except Exception as e:
+                                        mt["active"] = False
+                                        self.log.emit(f"[Manual Tracker] Error initializing MIL fallback ID {mt['track_id']}: {e}")
+                                else:
+                                    mt["active"] = False
+                                    self.log.emit(f"[Manual Tracker] MIL fallback ID {mt['track_id']} box too small ({w}x{h})")
+                            else:
+                                try:
+                                    success, bbox = mt["tracker"].update(frame)
+                                    if success:
+                                        tx, ty, tw, th = [int(v) for v in bbox]
+                                        x1 = max(0, min(tx, width - 1))
+                                        y1 = max(0, min(ty, height - 1))
+                                        x2 = max(0, min(tx + tw, width - 1))
+                                        y2 = max(0, min(ty + th, height - 1))
+                                        cx = (x1 + x2) // 2
+                                        cy = (y1 + y2) // 2
+
+                                        mt["box"]["x1"] = x1
+                                        mt["box"]["y1"] = y1
+                                        mt["box"]["x2"] = x2
+                                        mt["box"]["y2"] = y2
+
+                                        if roi_poly is not None and cv2.pointPolygonTest(roi_poly, (float(cx), float(cy)), False) < 0:
+                                            continue
+
+                                        manual_det = Detection(
+                                            frame=frame_idx,
+                                            track_id=mt["track_id"],
+                                            class_id=mt["class_id"],
+                                            class_name=mt["class_name"],
+                                            confidence=1.0,
+                                            x1=x1, y1=y1, x2=x2, y2=y2,
+                                            cx=cx, cy=cy
+                                        )
+                                        detections.append(manual_det)
+                                    else:
+                                        mt["active"] = False
+                                        self.log.emit(f"[Manual Tracker] MIL fallback lost target ID {mt['track_id']} at frame {frame_idx}")
+                                except Exception as e:
+                                    mt["active"] = False
+                                    self.log.emit(f"[Manual Tracker] Exception in MIL fallback ID {mt['track_id']} at frame {frame_idx}: {e}")
 
                 # Homography and GPS calculation
                 for det in detections:
@@ -1222,7 +1337,7 @@ class TrajectoryTab(QWidget):
         self.info_box.setStyleSheet(LABEL_STYLE)
         self.info_box.setWordWrap(True)
         self.info_box.setAlignment(Qt.AlignTop)
-        
+       
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border:none; background:transparent;")

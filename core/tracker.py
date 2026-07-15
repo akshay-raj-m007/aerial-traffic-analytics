@@ -100,6 +100,41 @@ class TrajectoryTracker:
     def get_pixel_trails(self) -> dict[int, list[tuple[int, int]]]:
         """Full unbounded pixel trail history for every track ever seen."""
         return {tid: t.pixel_trail for tid, t in self._tracks.items()}
+    
+    def get_render_trails(
+        self,
+        current_frame: int,
+        max_age_sec: float = 30.0,
+        fps: float | None = None,
+    ) -> dict[int, list[tuple[int, int]]]:
+        """
+        Trail data for DRAWING only — trimmed to the trailing `max_age_sec`
+        window. Tracks whose last update is older than max_age_sec are
+        omitted entirely (line disappears). Full history in self._tracks
+        is untouched, so summary()/gps_trail_rows() stay complete.
+
+        Usage: pass this instead of get_pixel_trails() into
+        Detector.annotate_frame() if you want trails to expire after
+        a vehicle has been gone for a while.
+        """
+        fps = fps or self.fps
+        max_age_frames = max_age_sec * fps
+
+        render_trails: dict[int, list[tuple[int, int]]] = {}
+        for tid, t in self._tracks.items():
+            if not t.frame_trail:
+                continue
+            # Vehicle gone longer than max_age_sec -> drop the whole trail
+            if (current_frame - t.last_frame) > max_age_frames:
+                continue
+            cutoff_frame = current_frame - max_age_frames
+            pts = [
+                pt for pt, f in zip(t.pixel_trail, t.frame_trail)
+                if f >= cutoff_frame
+            ]
+            if pts:
+                render_trails[tid] = pts
+        return render_trails
 
     def get_track_classes(self) -> dict[int, str]:
         """Returns {track_id: class_name} for every known track."""
